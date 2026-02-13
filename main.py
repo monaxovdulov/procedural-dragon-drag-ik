@@ -164,9 +164,21 @@ class Slider:
 
 
 class Leg:
-    def __init__(self, attach_idx: int, side: int, upper_len: float, lower_len: float):
+    def __init__(
+        self,
+        attach_idx: int,
+        side: int,
+        upper_len: float,
+        lower_len: float,
+        pair_id: int = 0,
+        is_front: bool = False,
+        name: str = "",
+    ):
         self.attach_idx = attach_idx
         self.side = side  # -1 / +1
+        self.pair_id = pair_id
+        self.is_front = is_front
+        self.name = name
 
         self.upper_len = upper_len
         self.lower_len = lower_len
@@ -177,6 +189,7 @@ class Leg:
         # Параметры шага:
         self.stepping = False
         self.step_time = 0.0
+        self.time_since_step = 0.0
         self.step_from = Vector2(0, 0)
         self.step_to = Vector2(0, 0)
         self.step_lift_dir = Vector2(0, -1)
@@ -186,14 +199,21 @@ class Leg:
         self.knee = Vector2(0, 0)
         self.foot = Vector2(0, 0)
 
+        # Движение точки крепления на позвоночнике (для direction-aware foothold).
+        self.prev_attach_pos = Vector2(0, 0)
+        self.attach_vel = Vector2(0, 0)
+
     def reset(self, initial_foot: Vector2):
         self.foot_target = Vector2(initial_foot)
         self.stepping = False
         self.step_time = 0.0
+        self.time_since_step = 0.0
+        self.attach_vel = Vector2(0, 0)
 
     def begin_step(self, hip: Vector2, new_target: Vector2, lift_dir: Vector2):
         self.stepping = True
         self.step_time = 0.0
+        self.time_since_step = 0.0
         self.step_from = Vector2(self.foot_target)
         self.step_to = Vector2(new_target)
         self.step_lift_dir = safe_normalize(lift_dir, Vector2(0, -1))
@@ -208,8 +228,17 @@ class Leg:
         if v.length() < min_reach:
             self.step_to = hip + safe_normalize(v) * min_reach
 
-    def update(self, dt: float, hip: Vector2, desired_foothold: Vector2,
-               step_threshold: float, step_duration: float, step_lift: float, bend_dir: float):
+    def update(
+        self,
+        dt: float,
+        hip: Vector2,
+        desired_foothold: Vector2,
+        step_threshold: float,
+        step_duration: float,
+        step_lift: float,
+        bend_dir: float,
+        can_start_step: bool = True,
+    ):
         self.hip = Vector2(hip)
 
         if self.stepping:
@@ -229,8 +258,12 @@ class Leg:
 
                 self.foot_target = pos
         else:
+            self.time_since_step += dt
             # Липкость: пока предполагаемая опора рядом, нога "держится" за старый foot_target.
-            if (desired_foothold - self.foot_target).length_squared() > (step_threshold * step_threshold):
+            if (
+                can_start_step
+                and (desired_foothold - self.foot_target).length_squared() > (step_threshold * step_threshold)
+            ):
                 # Направление подъёма: наружу от тела (слева/справа) + немного "вверх" по экрану.
                 lift_dir = safe_normalize(desired_foothold - hip, Vector2(0, -1))
                 self.begin_step(hip, desired_foothold, lift_dir)
@@ -272,7 +305,7 @@ class Dragon:
         self.rib_t_scale = 0.55      # насколько дуга тянется вдоль касательной
 
         # Лапки
-        self.leg_pairs = 7           # пар лап (итого 2*leg_pairs)
+        self.leg_pairs = 2           # квадрупед: 2 пары (перед/зад), итого 4 лапы
         self.leg_upper = 34.0
         self.leg_lower = 28.0
         self.leg_hip_offset = 12.0   # отступ точки "бедра" от позвоночника
@@ -282,6 +315,11 @@ class Dragon:
         self.step_duration = 0.28
         self.step_lift = 20.0
         self.leg_thickness = 5.0
+        self.stride_front = 22.0
+        self.stride_back = 16.0
+        self.move_vel_eps = 40.0
+        self.min_stance_time = 0.20
+        self.max_step_per_pair = 1
 
         # Рендер/UX
         self.mode = "hybrid"         # "bones" | "skin" | "hybrid"
@@ -305,20 +343,30 @@ class Dragon:
         for i in range(self.N):
             self.points.append(Vector2(center.x - i * self.L, center.y))
 
-        # Создаём лапки (пары, лев/прав на одном индексе позвоночника)
+        # Создаём квадрупед: две фиксированные пары крепления (front/back).
         self.legs = []
-        start_i = int(self.N * 0.18)
-        end_i = int(self.N * 0.66)
-        if self.leg_pairs < 1:
-            self.leg_pairs = 1
+        self.leg_pairs = 2
+        attach_front = clamp(int(self.N * 0.28), 0, self.N - 1)
+        attach_back = clamp(int(self.N * 0.55), 0, self.N - 1)
 
-        for j in range(self.leg_pairs):
-            t = 0.0 if self.leg_pairs == 1 else (j / (self.leg_pairs - 1))
-            attach_idx = int(start_i + (end_i - start_i) * t)
+        pair_specs = (
+            (0, True, int(attach_front), "F"),
+            (1, False, int(attach_back), "B"),
+        )
 
+        for pair_id, is_front, attach_idx, tag in pair_specs:
             # Лево/право (side = +1 / -1)
             for side in (+1, -1):
-                leg = Leg(attach_idx=attach_idx, side=side, upper_len=self.leg_upper, lower_len=self.leg_lower)
+                side_tag = "L" if side > 0 else "R"
+                leg = Leg(
+                    attach_idx=attach_idx,
+                    side=side,
+                    upper_len=self.leg_upper,
+                    lower_len=self.leg_lower,
+                    pair_id=pair_id,
+                    is_front=is_front,
+                    name=f"{tag}{side_tag}",
+                )
 
                 # Инициализируем опору в разумной позиции относительно тела.
                 # В начальной позе касательная ~ (1, 0), нормаль ~ (0, 1).
@@ -326,6 +374,7 @@ class Dragon:
                 foot = hip + Vector2(0, 1) * (side * self.leg_spread) + Vector2(-1, 0) * self.leg_back
                 foot += Vector2(random.uniform(-6, 6), random.uniform(-6, 6))
                 leg.reset(foot)
+                leg.prev_attach_pos = Vector2(self.points[attach_idx])
 
                 self.legs.append(leg)
 
@@ -348,6 +397,12 @@ class Dragon:
         t = safe_normalize(v, Vector2(1, 0))
         n = Vector2(-t.y, t.x)
         return t, n
+
+    def _pair_partner(self, pair_id: int, side: int) -> Leg | None:
+        for leg in self.legs:
+            if leg.pair_id == pair_id and leg.side == -side:
+                return leg
+        return None
 
     def update(self, dt: float, mouse_pos: tuple[int, int]):
         dt = clamp(dt, 0.0, 0.05)  # защита от огромного dt при alt-tab
@@ -416,6 +471,15 @@ class Dragon:
             cur.y = prev.y + math.sin(ang) * self.L
             self.points[i] = cur
 
+        for leg in self.legs:
+            idx = leg.attach_idx
+            attach_pos = self.points[idx]
+            if dt > 1e-9:
+                leg.attach_vel = (attach_pos - leg.prev_attach_pos) / dt
+            else:
+                leg.attach_vel = Vector2(0, 0)
+            leg.prev_attach_pos = Vector2(attach_pos)
+
         # ----------------------------
         # 3) Лапки: липкость + шаги
         # ----------------------------
@@ -426,15 +490,49 @@ class Dragon:
             # Точка бедра (hip) сидит сбоку от позвоночника.
             hip = self.points[idx] + n * (leg.side * self.leg_hip_offset)
 
-            # "Желаемая" опора: в сторону (spread) и немного в хвост (back).
-            # Чуть добавим колебание (но это только желаемая точка; липкость удержит реальную).
+            # "Желаемая" опора: в сторону + назад + stride по реальному движению точки крепления.
             u = idx / (self.N - 1)
             side_phase = 1.35 if leg.side < 0 else 0.0
-            wave = math.sin(self.time * (self.wave_speed * 0.8) - idx * 0.18 + side_phase) * (1.0 - u) * 4.0
-            desired = hip + n * (leg.side * (self.leg_spread + wave)) + (-t) * (self.leg_back + 6.0 * (1.0 - u))
+            pair_phase = 0.0 if leg.is_front else 1.1
+            wave = (
+                math.sin(self.time * (self.wave_speed * 0.8) - idx * 0.18 + side_phase + pair_phase)
+                * (1.0 - u)
+                * 4.0
+            )
 
-            # Bend dir: выбираем сторону сгиба колена (наружу).
-            bend_dir = float(leg.side)
+            speed = leg.attach_vel.length()
+            move_dir = safe_normalize(leg.attach_vel, t)
+
+            base_stride = self.stride_front if leg.is_front else self.stride_back
+            move_t = smoothstep01((speed - self.move_vel_eps) / max(1e-6, self.move_vel_eps))
+            stride = base_stride * move_t
+            stride *= 0.85 + 0.15 * math.sin(self.time * (self.wave_speed * 0.7) + pair_phase)
+
+            stance_back = self.leg_back + (4.0 if leg.is_front else 10.0) + 6.0 * (1.0 - u)
+            desired = (
+                hip
+                + n * (leg.side * (self.leg_spread + wave))
+                + move_dir * stride
+                + (-t) * stance_back
+            )
+
+            # Bend dir: front чуть "вперёд по движению", back чуть "назад".
+            forward_sign = 1.0 if move_dir.dot(t) >= 0.0 else -1.0
+            bend_side = float(leg.side if leg.is_front else -leg.side)
+            bend_dir = bend_side * forward_sign
+
+            pair_step_count = 0
+            for pair_leg in self.legs:
+                if pair_leg.pair_id == leg.pair_id and pair_leg.stepping:
+                    pair_step_count += 1
+
+            partner = self._pair_partner(leg.pair_id, leg.side)
+            partner_idle = (partner is None) or (not partner.stepping)
+            can_start_step = (
+                leg.time_since_step >= self.min_stance_time
+                and pair_step_count < self.max_step_per_pair
+                and partner_idle
+            )
 
             leg.upper_len = self.leg_upper
             leg.lower_len = self.leg_lower
@@ -445,7 +543,8 @@ class Dragon:
                 step_threshold=self.step_threshold,
                 step_duration=self.step_duration,
                 step_lift=self.step_lift,
-                bend_dir=bend_dir
+                bend_dir=bend_dir,
+                can_start_step=can_start_step,
             )
 
     def draw(self, screen: pygame.Surface):
@@ -542,19 +641,37 @@ class Dragon:
             # Небольшая тейперовка толщины лап в зависимости от положения по телу
             base = max(1, int(self.leg_thickness))
             u = leg.attach_idx / (self.N - 1)
-            w1 = max(2, int(base * (1.0 - 0.45 * u)))
-            w2 = max(2, int((base - 1) * (1.0 - 0.55 * u)))
+            w1 = max(3, int(base * (1.15 - 0.35 * u)))
+            w2 = max(2, int(base * (0.90 - 0.45 * u)))
 
             pygame.draw.line(screen, color, v2i(hip), v2i(knee), w1)
             pygame.draw.line(screen, color, v2i(knee), v2i(foot), w2)
 
-            # "Коготки" — три коротких штриха вокруг стопы
+            r_hip = max(2, int(base * 0.62))
+            r_knee = max(2, int(base * 0.56))
+            r_foot = max(2, int(base * 0.48))
+            pygame.draw.circle(screen, color, v2i(hip), r_hip, 1)
+            pygame.draw.circle(screen, color, v2i(knee), r_knee, 1)
+            pygame.draw.circle(screen, color, v2i(foot), r_foot, 1)
+
+            # "Ступня": маленький клин/ромб в базисе стопы.
             to_foot = safe_normalize(foot - knee, Vector2(1, 0))
             n = Vector2(-to_foot.y, to_foot.x)
-            claw_len = 6.0 * (1.0 - 0.4 * u)
+            foot_len = 10.0 * (1.0 - 0.25 * u)
+            foot_w = 4.8 * (1.0 - 0.30 * u)
+            toe = foot + to_foot * (foot_len * 0.75)
+            heel = foot - to_foot * (foot_len * 0.45)
+            left = heel + n * foot_w
+            right = heel - n * foot_w
+            mid = foot - to_foot * (foot_len * 0.08)
+            pygame.draw.polygon(screen, color, [v2i(toe), v2i(left), v2i(mid), v2i(right)], 1)
+
+            # Когти привязаны к базису ступни.
+            claw_len = 4.8 * (1.0 - 0.35 * u)
             for s in (-1, 0, +1):
-                tip = foot + to_foot * claw_len + n * (s * 2.2)
-                pygame.draw.line(screen, color, v2i(foot), v2i(tip), 1)
+                base_pt = toe + n * (s * 1.8)
+                tip = base_pt + to_foot * claw_len + n * (s * 1.1)
+                pygame.draw.line(screen, color, v2i(base_pt), v2i(tip), 1)
 
             if debug_color is not None:
                 pygame.draw.circle(screen, debug_color, v2i(leg.foot_target), 3, 1)
@@ -591,114 +708,27 @@ class Dragon:
 
 
 PRESETS: dict[str, dict[str, float | int]] = {
-    "noodle": {
+    "quadruped_real": {
+        "leg_pairs": 2,
         "head_spring": 18.0,
         "head_damping": 9.5,
-        "head_max_speed": 850.0,
-        "wave_amp": 7.0,
-        "wave_freq": 0.42,
-        "wave_speed": 3.0,
-        "leg_upper": 32.0,
-        "leg_lower": 26.0,
-        "leg_spread": 40.0,
-        "leg_back": 16.0,
-        "leg_hip_offset": 12.0,
-        "step_threshold": 60.0,
-        "step_duration": 0.30,
-        "step_lift": 18.0,
-        "leg_thickness": 4.0,
-    },
-    "imperial": {
-        "head_spring": 14.0,
-        "head_damping": 11.5,
-        "head_max_speed": 650.0,
-        "wave_amp": 3.8,
-        "wave_freq": 0.26,
-        "wave_speed": 1.8,
-        "leg_upper": 46.0,
-        "leg_lower": 38.0,
-        "leg_spread": 56.0,
-        "leg_back": 24.0,
-        "leg_hip_offset": 14.0,
-        "step_threshold": 85.0,
-        "step_duration": 0.42,
-        "step_lift": 20.0,
-        "leg_thickness": 7.0,
-    },
-    "agile": {
-        "head_spring": 32.0,
-        "head_damping": 6.5,
-        "head_max_speed": 1400.0,
-        "wave_amp": 6.0,
-        "wave_freq": 0.50,
-        "wave_speed": 4.6,
-        "leg_upper": 36.0,
-        "leg_lower": 30.0,
-        "leg_spread": 44.0,
-        "leg_back": 18.0,
-        "leg_hip_offset": 12.0,
-        "step_threshold": 48.0,
-        "step_duration": 0.22,
-        "step_lift": 22.0,
-        "leg_thickness": 5.0,
-    },
-    "heavy": {
-        "head_spring": 10.0,
-        "head_damping": 13.0,
-        "head_max_speed": 520.0,
-        "wave_amp": 2.8,
-        "wave_freq": 0.22,
-        "wave_speed": 1.2,
-        "leg_upper": 52.0,
-        "leg_lower": 44.0,
-        "leg_spread": 60.0,
-        "leg_back": 26.0,
-        "leg_hip_offset": 16.0,
-        "step_threshold": 100.0,
-        "step_duration": 0.55,
-        "step_lift": 16.0,
-        "leg_thickness": 8.0,
-    },
-    "cartoon": {
-        "head_spring": 26.0,
-        "head_damping": 7.5,
-        "head_max_speed": 1200.0,
-        "wave_amp": 10.5,
-        "wave_freq": 0.62,
-        "wave_speed": 5.4,
-        "leg_upper": 40.0,
-        "leg_lower": 34.0,
+        "head_max_speed": 820.0,
+        "wave_amp": 4.2,
+        "wave_freq": 0.30,
+        "wave_speed": 2.1,
+        "leg_upper": 44.0,
+        "leg_lower": 36.0,
         "leg_spread": 52.0,
-        "leg_back": 20.0,
-        "leg_hip_offset": 13.0,
-        "step_threshold": 55.0,
-        "step_duration": 0.26,
-        "step_lift": 28.0,
+        "leg_back": 22.0,
+        "leg_hip_offset": 14.0,
+        "step_threshold": 62.0,
+        "step_duration": 0.31,
+        "step_lift": 17.0,
         "leg_thickness": 6.0,
-    },
-    "cloud_long": {
-        "N": 160,
-        "L": 6.2,
-        "radius_head": 20.0,
-        "radius_tail": 3.0,
-        "head_spring": 16.0,
-        "head_damping": 10.0,
-        "head_max_speed": 900.0,
-        "wave_amp": 6.5,
-        "wave_freq": 0.33,
-        "wave_speed": 2.4,
-    },
-    "centipede": {
-        "leg_pairs": 12,
-        "leg_upper": 28.0,
-        "leg_lower": 24.0,
-        "leg_spread": 36.0,
-        "leg_back": 14.0,
-        "leg_hip_offset": 10.0,
-        "step_threshold": 40.0,
-        "step_duration": 0.20,
-        "step_lift": 14.0,
-        "leg_thickness": 3.0,
+        "stride_front": 24.0,
+        "stride_back": 14.0,
+        "min_stance_time": 0.24,
+        "move_vel_eps": 55.0,
     },
 }
 
@@ -767,9 +797,13 @@ def main():
         ("leg_lower", "leg_lower", 10.0, 90.0, "{:.0f}", False),
         ("leg_spread", "leg_spread", 0.0, 90.0, "{:.0f}", False),
         ("leg_back", "leg_back", 0.0, 60.0, "{:.0f}", False),
+        ("stride_front", "stride_front", 0.0, 60.0, "{:.0f}", False),
+        ("stride_back", "stride_back", 0.0, 60.0, "{:.0f}", False),
+        ("move_vel_eps", "move_vel_eps", 0.0, 220.0, "{:.0f}", False),
         ("hip_offset", "leg_hip_offset", 0.0, 30.0, "{:.0f}", False),
         ("step_thresh", "step_threshold", 5.0, 120.0, "{:.0f}", False),
         ("step_dur", "step_duration", 0.05, 0.70, "{:.2f}", False),
+        ("min_stance", "min_stance_time", 0.05, 0.70, "{:.2f}", False),
         ("step_lift", "step_lift", 0.0, 40.0, "{:.0f}", False),
         ("leg_thick", "leg_thickness", 1.0, 10.0, "{:.0f}", False),
     ]
@@ -829,19 +863,7 @@ def main():
                 elif event.key == pygame.K_TAB:
                     ui_visible = not ui_visible
                 elif event.key == pygame.K_F1:
-                    apply_preset(dragon, PRESETS["noodle"], sliders)
-                elif event.key == pygame.K_F2:
-                    apply_preset(dragon, PRESETS["imperial"], sliders)
-                elif event.key == pygame.K_F3:
-                    apply_preset(dragon, PRESETS["agile"], sliders)
-                elif event.key == pygame.K_F4:
-                    apply_preset(dragon, PRESETS["heavy"], sliders)
-                elif event.key == pygame.K_F5:
-                    apply_preset(dragon, PRESETS["cartoon"], sliders)
-                elif event.key == pygame.K_F6:
-                    apply_preset(dragon, PRESETS["centipede"], sliders)
-                elif event.key == pygame.K_F7:
-                    apply_preset(dragon, PRESETS["cloud_long"], sliders)
+                    apply_preset(dragon, PRESETS["quadruped_real"], sliders)
 
         mouse_pos = pygame.mouse.get_pos()
         apply_sliders(dragon)
@@ -858,13 +880,13 @@ def main():
             for s in sliders:
                 s.draw(screen, ui_font)
 
-            hint = ui_font.render("TAB: UI on/off | drag sliders", True, (150, 150, 170))
+            hint = ui_font.render("TAB: UI on/off | drag sliders | F1: quadruped_real", True, (150, 150, 170))
             screen.blit(hint, (panel_x - 4, panel_y - 28))
 
         # Лёгкий overlay подсказок
         info = (
             f"mode={dragon.mode} | D=debug({dragon.debug}) | R=reset | "
-            "1/2/3 modes | F1..F7 presets | ESC=quit"
+            "1/2/3 modes | F1 preset | ESC=quit"
         )
         surf = font.render(info, True, (150, 150, 170))
         screen.blit(surf, (12, 10))
