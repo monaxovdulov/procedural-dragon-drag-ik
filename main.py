@@ -187,16 +187,20 @@ class Leg:
         self.upper_len = upper_len
         self.lower_len = lower_len
 
+        # Точка крепления к телу (обновляется каждый кадр из Dragon.update).
+        self.anchor = Vector2(0, 0)
+
         # Липкая точка опоры в мире:
+        self.foot_pos = Vector2(0, 0)
         self.foot_target = Vector2(0, 0)
 
         # Параметры шага:
         self.stepping = False
-        self.step_time = 0.0
+        self.step_progress = 0.0
         self.time_since_step = 0.0
-        self.step_from = Vector2(0, 0)
-        self.step_to = Vector2(0, 0)
-        self.step_lift_dir = Vector2(0, -1)
+        self.step_start = Vector2(0, 0)
+        self.step_target = Vector2(0, 0)
+        self.step_perp = Vector2(0, -1)
         self.lift01 = 0.0  # 0..1..0 только для визуала во время swing
 
         # Для отрисовки:
@@ -209,75 +213,102 @@ class Leg:
         self.attach_vel = Vector2(0, 0)
 
     def reset(self, initial_foot: Vector2):
+        self.foot_pos = Vector2(initial_foot)
         self.foot_target = Vector2(initial_foot)
         self.stepping = False
-        self.step_time = 0.0
+        self.step_progress = 0.0
         self.time_since_step = 0.0
         self.attach_vel = Vector2(0, 0)
         self.lift01 = 0.0
 
-    def begin_step(self, hip: Vector2, new_target: Vector2, lift_dir: Vector2):
+    def begin_step(self, hip: Vector2, new_target: Vector2, out_dir: Vector2):
         self.stepping = True
-        self.step_time = 0.0
+        self.step_progress = 0.0
         self.time_since_step = 0.0
-        self.step_from = Vector2(self.foot_target)
-        self.step_to = Vector2(new_target)
-        self.step_lift_dir = safe_normalize(lift_dir, Vector2(0, -1))
+        self.step_start = Vector2(self.foot_pos)
+        self.step_target = Vector2(new_target)
 
         # Чуть гарантируем достижимость конечной опоры:
         reach = self.upper_len + self.lower_len - 1e-3
-        v = self.step_to - hip
+        v = self.step_target - hip
         if v.length_squared() > reach * reach:
-            self.step_to = hip + safe_normalize(v) * reach
+            self.step_target = hip + safe_normalize(v) * reach
+            v = self.step_target - hip
 
         min_reach = abs(self.upper_len - self.lower_len) + 1e-3
         if v.length() < min_reach:
-            self.step_to = hip + safe_normalize(v) * min_reach
+            self.step_target = hip + safe_normalize(v) * min_reach
+
+        step_dir = safe_normalize(self.step_target - self.step_start, Vector2(1, 0))
+        step_perp = Vector2(-step_dir.y, step_dir.x)
+        out = safe_normalize(out_dir, Vector2(0, 1))
+        if step_perp.dot(out) < 0.0:
+            step_perp = -step_perp
+        self.step_perp = safe_normalize(step_perp, Vector2(0, -1))
 
     def update(
         self,
         dt: float,
+        anchor: Vector2,
         hip: Vector2,
         desired_foothold: Vector2,
         step_threshold: float,
         step_duration: float,
         step_lift: float,
-        bend_dir: float,
+        out_dir: Vector2,
+        preferred_bend_dir: float,
         can_start_step: bool = True,
     ):
+        self.anchor = Vector2(anchor)
         self.hip = Vector2(hip)
+        out = safe_normalize(out_dir, Vector2(float(self.side), 0.0))
 
         if self.stepping:
-            self.step_time += dt
-            u = 1.0 if step_duration <= 1e-6 else (self.step_time / step_duration)
+            self.step_progress += 1.0 if step_duration <= 1e-6 else (dt / step_duration)
+            p = clamp(self.step_progress, 0.0, 1.0)
 
-            if u >= 1.0:
+            if p >= 1.0:
                 self.stepping = False
-                self.foot_target = Vector2(self.step_to)
+                self.foot_pos = Vector2(self.step_target)
                 self.lift01 = 0.0
             else:
-                s = smoothstep01(smoothstep01(u))
-                pos = self.step_from * (1.0 - s) + self.step_to * s
+                # Более "вязкая" кривая переноса: сглаживаем прогресс дважды.
+                s = smoothstep01(smoothstep01(p))
+                pos = self.step_start.lerp(self.step_target, s)
 
-                # Классическая "дуга шага": sin(pi*s) даёт 0 в концах и пик в середине.
-                self.lift01 = math.sin(math.pi * s)
-                pos += self.step_lift_dir * (self.lift01 * step_lift)
+                # Дуга переноса: по перпендикуляру к направлению шага.
+                self.lift01 = math.sin(math.pi * p)
+                pos += self.step_perp * (self.lift01 * step_lift)
 
-                self.foot_target = pos
+                self.foot_pos = pos
         else:
             self.time_since_step += dt
             self.lift01 = 0.0
-            # Липкость: пока предполагаемая опора рядом, нога "держится" за старый foot_target.
+            # Липкость: пока предполагаемая опора рядом, нога "держится" за старый foot_pos.
             if (
                 can_start_step
-                and (desired_foothold - self.foot_target).length_squared() > (step_threshold * step_threshold)
+                and (desired_foothold - self.foot_pos).length_squared() > (step_threshold * step_threshold)
             ):
-                # Направление подъёма: наружу от тела (слева/справа) + немного "вверх" по экрану.
-                lift_dir = safe_normalize(desired_foothold - hip, Vector2(0, -1))
-                self.begin_step(hip, desired_foothold, lift_dir)
+                self.begin_step(hip, desired_foothold, out)
 
-        # 2-bone IK только для позы (визуала)
-        self.knee, self.foot = solve_two_bone_ik_2d(self.hip, self.foot_target, self.upper_len, self.lower_len, bend_dir)
+        self.foot_target = Vector2(self.foot_pos)
+
+        # 2-bone IK для позы: выбираем ветку, где колено смотрит наружу от корпуса.
+        knee_plus, foot_plus = solve_two_bone_ik_2d(self.hip, self.foot_pos, self.upper_len, self.lower_len, +1.0)
+        knee_minus, foot_minus = solve_two_bone_ik_2d(self.hip, self.foot_pos, self.upper_len, self.lower_len, -1.0)
+
+        score_plus = (knee_plus - self.hip).dot(out)
+        score_minus = (knee_minus - self.hip).dot(out)
+
+        if abs(score_plus - score_minus) < 1e-6:
+            if preferred_bend_dir >= 0.0:
+                self.knee, self.foot = knee_plus, foot_plus
+            else:
+                self.knee, self.foot = knee_minus, foot_minus
+        elif score_plus > score_minus:
+            self.knee, self.foot = knee_plus, foot_plus
+        else:
+            self.knee, self.foot = knee_minus, foot_minus
 
 
 class Dragon:
@@ -381,10 +412,12 @@ class Dragon:
                 # Инициализируем опору в разумной позиции относительно тела.
                 # В начальной позе касательная ~ (1, 0), нормаль ~ (0, 1).
                 r_body = self._radius_at(attach_idx)
-                hip = self.points[attach_idx] + Vector2(0, 1) * (side * (r_body + self.leg_hip_offset))
+                anchor = self.points[attach_idx] + Vector2(0, 1) * (side * r_body)
+                hip = anchor + Vector2(0, 1) * (side * self.leg_hip_offset)
                 foot = hip + Vector2(0, 1) * (side * self.leg_spread) + Vector2(-1, 0) * self.leg_back
                 foot += Vector2(random.uniform(-6, 6), random.uniform(-6, 6))
                 leg.reset(foot)
+                leg.anchor = Vector2(anchor)
                 leg.prev_attach_pos = Vector2(self.points[attach_idx])
 
                 self.legs.append(leg)
@@ -494,7 +527,7 @@ class Dragon:
         # ----------------------------
         # 3) Лапки: липкость + шаги + простой gait controller (диагонали)
         # ----------------------------
-        leg_ctx: list[tuple[Leg, Vector2, Vector2, Vector2, float, float]] = []
+        leg_ctx: list[tuple[Leg, Vector2, Vector2, Vector2, Vector2, float, float]] = []
         thr2 = self.step_threshold * self.step_threshold
         any_stepping = any(l.stepping for l in self.legs)
 
@@ -502,9 +535,10 @@ class Dragon:
             idx = leg.attach_idx
             t, n = self._frame_at(idx)
 
-            # Точка бедра (hip) сидит на "радиусе" тела, а не в центре позвоночника.
+            # Точка крепления жёстко привязана к позвоночнику через радиус тела.
             r_body = self._radius_at(idx)
-            hip = self.points[idx] + n * (leg.side * (r_body + self.leg_hip_offset))
+            anchor = self.points[idx] + n * (leg.side * r_body)
+            hip = anchor + n * (leg.side * self.leg_hip_offset)
 
             # "Желаемая" опора: в сторону + назад + stride по реальному движению точки крепления.
             u = idx / (self.N - 1)
@@ -535,10 +569,11 @@ class Dragon:
             # Bend dir: front чуть "вперёд по движению", back чуть "назад".
             forward_sign = 1.0 if move_dir.dot(t) >= 0.0 else -1.0
             bend_side = float(leg.side if leg.is_front else -leg.side)
-            bend_dir = bend_side * forward_sign
+            preferred_bend_dir = bend_side * forward_sign
 
-            dist2 = (desired - leg.foot_target).length_squared()
-            leg_ctx.append((leg, hip, desired, move_dir, bend_dir, dist2))
+            out_dir = n * float(leg.side)
+            dist2 = (desired - leg.foot_pos).length_squared()
+            leg_ctx.append((leg, anchor, hip, desired, out_dir, preferred_bend_dir, dist2))
 
         # Переключаем диагональ только когда все лапы в stance (иначе будут "две диагонали сразу").
         if not any_stepping:
@@ -546,13 +581,13 @@ class Dragon:
                 (leg.diag_id == self.gait_diagonal)
                 and (dist2 > thr2)
                 and (leg.time_since_step >= self.min_stance_time)
-                for (leg, _hip, _desired, _move_dir, _bend_dir, dist2) in leg_ctx
+                for (leg, _anchor, _hip, _desired, _out, _pref_bend, dist2) in leg_ctx
             )
             other_need = any(
                 (leg.diag_id != self.gait_diagonal)
                 and (dist2 > thr2)
                 and (leg.time_since_step >= self.min_stance_time)
-                for (leg, _hip, _desired, _move_dir, _bend_dir, dist2) in leg_ctx
+                for (leg, _anchor, _hip, _desired, _out, _pref_bend, dist2) in leg_ctx
             )
             if (not active_need) and other_need:
                 self.gait_diagonal = 1 - self.gait_diagonal
@@ -562,10 +597,10 @@ class Dragon:
             (leg.diag_id == self.gait_diagonal)
             and (dist2 > thr2)
             and (leg.time_since_step >= self.min_stance_time)
-            for (leg, _hip, _desired, _move_dir, _bend_dir, dist2) in leg_ctx
+            for (leg, _anchor, _hip, _desired, _out, _pref_bend, dist2) in leg_ctx
         )
 
-        for leg, hip, desired, move_dir, bend_dir, dist2 in leg_ctx:
+        for leg, anchor, hip, desired, out_dir, preferred_bend_dir, dist2 in leg_ctx:
             pair_step_count = 0
             for pair_leg in self.legs:
                 if pair_leg.pair_id == leg.pair_id and pair_leg.stepping:
@@ -590,12 +625,14 @@ class Dragon:
             leg.lower_len = self.leg_lower
             leg.update(
                 dt=dt,
+                anchor=anchor,
                 hip=hip,
                 desired_foothold=desired,
                 step_threshold=step_thr,
                 step_duration=self.step_duration,
                 step_lift=self.step_lift,
-                bend_dir=bend_dir,
+                out_dir=out_dir,
+                preferred_bend_dir=preferred_bend_dir,
                 can_start_step=can_start_step,
             )
 
@@ -825,6 +862,8 @@ class Dragon:
         for leg in self.legs:
             p = self.points[leg.attach_idx]
             pygame.draw.circle(screen, color2, v2i(p), 4, 1)
+            pygame.draw.circle(screen, color2, v2i(leg.anchor), 3, 1)
+            pygame.draw.line(screen, color2, v2i(p), v2i(leg.anchor), 1)
 
 
 PRESETS: dict[str, dict[str, float | int]] = {
