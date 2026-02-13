@@ -78,6 +78,91 @@ def solve_two_bone_ik_2d(hip: Vector2, target: Vector2, upper_len: float, lower_
     return knee, foot
 
 
+class Slider:
+    def __init__(
+        self,
+        label: str,
+        attr: str,
+        x: int,
+        y: int,
+        w: int,
+        vmin: float,
+        vmax: float,
+        value: float,
+        fmt: str = "{:.2f}",
+        is_int: bool = False,
+    ):
+        self.label = label
+        self.attr = attr
+        self.x, self.y, self.w = x, y, w
+        self.vmin, self.vmax = float(vmin), float(vmax)
+        self.value = float(value)
+        self.fmt = fmt
+        self.is_int = is_int
+
+        self.h = 18
+        self.dragging = False
+
+    def _t_from_value(self) -> float:
+        if self.vmax <= self.vmin:
+            return 0.0
+        return (self.value - self.vmin) / (self.vmax - self.vmin)
+
+    def _value_from_t(self, t: float) -> float:
+        t = clamp(t, 0.0, 1.0)
+        v = self.vmin + (self.vmax - self.vmin) * t
+        if self.is_int:
+            return float(int(round(v)))
+        return v
+
+    def _knob_x(self) -> int:
+        t = self._t_from_value()
+        return int(self.x + t * self.w)
+
+    def handle_event(self, event: pygame.event.Event) -> bool:
+        """Возвращает True, если событие обработано UI."""
+        mx, my = pygame.mouse.get_pos()
+
+        track_rect = pygame.Rect(self.x, self.y + 10, self.w, 4)
+        knob_x = self._knob_x()
+        knob_rect = pygame.Rect(knob_x - 7, self.y + 4, 14, 16)
+
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if knob_rect.collidepoint(mx, my) or track_rect.collidepoint(mx, my):
+                self.dragging = True
+                t = (mx - self.x) / float(self.w)
+                self.value = self._value_from_t(t)
+                return True
+
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            if self.dragging:
+                self.dragging = False
+                return True
+
+        if event.type == pygame.MOUSEMOTION and self.dragging:
+            t = (mx - self.x) / float(self.w)
+            self.value = self._value_from_t(t)
+            return True
+
+        return False
+
+    def draw(
+        self,
+        screen: pygame.Surface,
+        font: pygame.font.Font,
+        color_fg=(190, 190, 210),
+        color_bg=(70, 70, 90),
+    ):
+        val_txt = self.fmt.format(self.value)
+        text = font.render(f"{self.label}: {val_txt}", True, color_fg)
+        screen.blit(text, (self.x, self.y - 2))
+
+        pygame.draw.rect(screen, color_bg, (self.x, self.y + 10, self.w, 4), border_radius=2)
+
+        kx = self._knob_x()
+        pygame.draw.circle(screen, color_fg, (kx, self.y + 12), 7, 1)
+
+
 class Leg:
     def __init__(self, attach_idx: int, side: int, upper_len: float, lower_len: float):
         self.attach_idx = attach_idx
@@ -135,7 +220,7 @@ class Leg:
                 self.stepping = False
                 self.foot_target = Vector2(self.step_to)
             else:
-                s = smoothstep01(u)
+                s = smoothstep01(smoothstep01(u))
                 pos = self.step_from * (1.0 - s) + self.step_to * s
 
                 # Классическая "дуга шага": sin(pi*s) даёт 0 в концах и пик в середине.
@@ -188,14 +273,15 @@ class Dragon:
 
         # Лапки
         self.leg_pairs = 7           # пар лап (итого 2*leg_pairs)
-        self.leg_upper = 22.0
-        self.leg_lower = 18.0
-        self.leg_hip_offset = 9.0    # отступ точки "бедра" от позвоночника
-        self.leg_spread = 24.0       # куда в среднем тянется опора в сторону
-        self.leg_back = 12.0         # куда в среднем тянется опора назад (к хвосту)
-        self.step_threshold = 30.0
-        self.step_duration = 0.16
-        self.step_lift = 14.0
+        self.leg_upper = 34.0
+        self.leg_lower = 28.0
+        self.leg_hip_offset = 12.0   # отступ точки "бедра" от позвоночника
+        self.leg_spread = 42.0       # куда в среднем тянется опора в сторону
+        self.leg_back = 18.0         # куда в среднем тянется опора назад (к хвосту)
+        self.step_threshold = 55.0
+        self.step_duration = 0.28
+        self.step_lift = 20.0
+        self.leg_thickness = 5.0
 
         # Рендер/UX
         self.mode = "hybrid"         # "bones" | "skin" | "hybrid"
@@ -343,12 +429,15 @@ class Dragon:
             # "Желаемая" опора: в сторону (spread) и немного в хвост (back).
             # Чуть добавим колебание (но это только желаемая точка; липкость удержит реальную).
             u = idx / (self.N - 1)
-            wave = math.sin(self.time * (self.wave_speed * 0.8) - idx * 0.18) * (1.0 - u) * 4.0
+            side_phase = 1.35 if leg.side < 0 else 0.0
+            wave = math.sin(self.time * (self.wave_speed * 0.8) - idx * 0.18 + side_phase) * (1.0 - u) * 4.0
             desired = hip + n * (leg.side * (self.leg_spread + wave)) + (-t) * (self.leg_back + 6.0 * (1.0 - u))
 
             # Bend dir: выбираем сторону сгиба колена (наружу).
             bend_dir = float(leg.side)
 
+            leg.upper_len = self.leg_upper
+            leg.lower_len = self.leg_lower
             leg.update(
                 dt=dt,
                 hip=hip,
@@ -451,9 +540,10 @@ class Dragon:
             foot = leg.foot
 
             # Небольшая тейперовка толщины лап в зависимости от положения по телу
+            base = max(1, int(self.leg_thickness))
             u = leg.attach_idx / (self.N - 1)
-            w1 = max(1, int(2 - 1 * u))
-            w2 = 1
+            w1 = max(2, int(base * (1.0 - 0.45 * u)))
+            w2 = max(2, int((base - 1) * (1.0 - 0.55 * u)))
 
             pygame.draw.line(screen, color, v2i(hip), v2i(knee), w1)
             pygame.draw.line(screen, color, v2i(knee), v2i(foot), w2)
@@ -500,6 +590,152 @@ class Dragon:
             pygame.draw.circle(screen, color2, v2i(p), 4, 1)
 
 
+PRESETS: dict[str, dict[str, float | int]] = {
+    "noodle": {
+        "head_spring": 18.0,
+        "head_damping": 9.5,
+        "head_max_speed": 850.0,
+        "wave_amp": 7.0,
+        "wave_freq": 0.42,
+        "wave_speed": 3.0,
+        "leg_upper": 32.0,
+        "leg_lower": 26.0,
+        "leg_spread": 40.0,
+        "leg_back": 16.0,
+        "leg_hip_offset": 12.0,
+        "step_threshold": 60.0,
+        "step_duration": 0.30,
+        "step_lift": 18.0,
+        "leg_thickness": 4.0,
+    },
+    "imperial": {
+        "head_spring": 14.0,
+        "head_damping": 11.5,
+        "head_max_speed": 650.0,
+        "wave_amp": 3.8,
+        "wave_freq": 0.26,
+        "wave_speed": 1.8,
+        "leg_upper": 46.0,
+        "leg_lower": 38.0,
+        "leg_spread": 56.0,
+        "leg_back": 24.0,
+        "leg_hip_offset": 14.0,
+        "step_threshold": 85.0,
+        "step_duration": 0.42,
+        "step_lift": 20.0,
+        "leg_thickness": 7.0,
+    },
+    "agile": {
+        "head_spring": 32.0,
+        "head_damping": 6.5,
+        "head_max_speed": 1400.0,
+        "wave_amp": 6.0,
+        "wave_freq": 0.50,
+        "wave_speed": 4.6,
+        "leg_upper": 36.0,
+        "leg_lower": 30.0,
+        "leg_spread": 44.0,
+        "leg_back": 18.0,
+        "leg_hip_offset": 12.0,
+        "step_threshold": 48.0,
+        "step_duration": 0.22,
+        "step_lift": 22.0,
+        "leg_thickness": 5.0,
+    },
+    "heavy": {
+        "head_spring": 10.0,
+        "head_damping": 13.0,
+        "head_max_speed": 520.0,
+        "wave_amp": 2.8,
+        "wave_freq": 0.22,
+        "wave_speed": 1.2,
+        "leg_upper": 52.0,
+        "leg_lower": 44.0,
+        "leg_spread": 60.0,
+        "leg_back": 26.0,
+        "leg_hip_offset": 16.0,
+        "step_threshold": 100.0,
+        "step_duration": 0.55,
+        "step_lift": 16.0,
+        "leg_thickness": 8.0,
+    },
+    "cartoon": {
+        "head_spring": 26.0,
+        "head_damping": 7.5,
+        "head_max_speed": 1200.0,
+        "wave_amp": 10.5,
+        "wave_freq": 0.62,
+        "wave_speed": 5.4,
+        "leg_upper": 40.0,
+        "leg_lower": 34.0,
+        "leg_spread": 52.0,
+        "leg_back": 20.0,
+        "leg_hip_offset": 13.0,
+        "step_threshold": 55.0,
+        "step_duration": 0.26,
+        "step_lift": 28.0,
+        "leg_thickness": 6.0,
+    },
+    "cloud_long": {
+        "N": 160,
+        "L": 6.2,
+        "radius_head": 20.0,
+        "radius_tail": 3.0,
+        "head_spring": 16.0,
+        "head_damping": 10.0,
+        "head_max_speed": 900.0,
+        "wave_amp": 6.5,
+        "wave_freq": 0.33,
+        "wave_speed": 2.4,
+    },
+    "centipede": {
+        "leg_pairs": 12,
+        "leg_upper": 28.0,
+        "leg_lower": 24.0,
+        "leg_spread": 36.0,
+        "leg_back": 14.0,
+        "leg_hip_offset": 10.0,
+        "step_threshold": 40.0,
+        "step_duration": 0.20,
+        "step_lift": 14.0,
+        "leg_thickness": 3.0,
+    },
+}
+
+HARD_KEYS = {
+    "N",
+    "L",
+    "leg_pairs",
+    "radius_head",
+    "radius_tail",
+    "rib_every",
+    "rib_samples",
+    "rib_arc",
+    "rib_t_scale",
+    "rib_width",
+}
+
+
+def apply_preset(dragon: Dragon, preset: dict[str, float | int], sliders: list[Slider] | None = None):
+    hard = any(k in preset for k in HARD_KEYS)
+    slider_by_attr = {s.attr: s for s in sliders} if sliders is not None else {}
+
+    for k, v in preset.items():
+        if hasattr(dragon, k):
+            setattr(dragon, k, v)
+
+        s = slider_by_attr.get(k)
+        if s is not None:
+            vv = float(v)
+            vv = clamp(vv, s.vmin, s.vmax)
+            if s.is_int:
+                vv = float(int(round(vv)))
+            s.value = vv
+
+    if hard:
+        dragon.reset()
+
+
 def main():
     pygame.init()
     pygame.display.set_caption("Procedural Dragon (Drag IK + Ribs + Sticky Legs)")
@@ -512,12 +748,68 @@ def main():
     font = pygame.font.SysFont("consolas", 16)
 
     dragon = Dragon(screen_size=(W, H))
+    ui_font = pygame.font.SysFont("consolas", 14)
+    ui_visible = True
+
+    panel_x = 12
+    panel_y = 36
+    panel_w = 260
+    row = 28
+
+    slider_specs = [
+        ("head_spring", "head_spring", 0.0, 60.0, "{:.1f}", False),
+        ("head_damping", "head_damping", 0.0, 20.0, "{:.1f}", False),
+        ("head_max_spd", "head_max_speed", 100.0, 1600.0, "{:.0f}", False),
+        ("wave_amp", "wave_amp", 0.0, 16.0, "{:.1f}", False),
+        ("wave_freq", "wave_freq", 0.0, 1.20, "{:.2f}", False),
+        ("wave_speed", "wave_speed", 0.0, 8.0, "{:.2f}", False),
+        ("leg_upper", "leg_upper", 10.0, 90.0, "{:.0f}", False),
+        ("leg_lower", "leg_lower", 10.0, 90.0, "{:.0f}", False),
+        ("leg_spread", "leg_spread", 0.0, 90.0, "{:.0f}", False),
+        ("leg_back", "leg_back", 0.0, 60.0, "{:.0f}", False),
+        ("hip_offset", "leg_hip_offset", 0.0, 30.0, "{:.0f}", False),
+        ("step_thresh", "step_threshold", 5.0, 120.0, "{:.0f}", False),
+        ("step_dur", "step_duration", 0.05, 0.70, "{:.2f}", False),
+        ("step_lift", "step_lift", 0.0, 40.0, "{:.0f}", False),
+        ("leg_thick", "leg_thickness", 1.0, 10.0, "{:.0f}", False),
+    ]
+
+    sliders: list[Slider] = []
+    for i, (label, attr, vmin, vmax, fmt, is_int) in enumerate(slider_specs):
+        y = panel_y + i * row
+        sliders.append(
+            Slider(
+                label=label,
+                attr=attr,
+                x=panel_x,
+                y=y,
+                w=panel_w,
+                vmin=vmin,
+                vmax=vmax,
+                value=float(getattr(dragon, attr)),
+                fmt=fmt,
+                is_int=is_int,
+            )
+        )
+
+    def apply_sliders(dr: Dragon):
+        for s in sliders:
+            setattr(dr, s.attr, s.value)
 
     running = True
     while running:
         dt = clock.tick(60) / 1000.0  # dt в секундах
 
         for event in pygame.event.get():
+            ui_consumed = False
+            if ui_visible:
+                for s in sliders:
+                    if s.handle_event(event):
+                        ui_consumed = True
+                        break
+            if ui_consumed:
+                continue
+
             if event.type == pygame.QUIT:
                 running = False
 
@@ -534,15 +826,46 @@ def main():
                     dragon.mode = "skin"
                 elif event.key == pygame.K_3:
                     dragon.mode = "hybrid"
+                elif event.key == pygame.K_TAB:
+                    ui_visible = not ui_visible
+                elif event.key == pygame.K_F1:
+                    apply_preset(dragon, PRESETS["noodle"], sliders)
+                elif event.key == pygame.K_F2:
+                    apply_preset(dragon, PRESETS["imperial"], sliders)
+                elif event.key == pygame.K_F3:
+                    apply_preset(dragon, PRESETS["agile"], sliders)
+                elif event.key == pygame.K_F4:
+                    apply_preset(dragon, PRESETS["heavy"], sliders)
+                elif event.key == pygame.K_F5:
+                    apply_preset(dragon, PRESETS["cartoon"], sliders)
+                elif event.key == pygame.K_F6:
+                    apply_preset(dragon, PRESETS["centipede"], sliders)
+                elif event.key == pygame.K_F7:
+                    apply_preset(dragon, PRESETS["cloud_long"], sliders)
 
         mouse_pos = pygame.mouse.get_pos()
+        apply_sliders(dragon)
         dragon.update(dt, mouse_pos)
 
         screen.fill((0, 0, 0))
         dragon.draw(screen)
 
+        if ui_visible:
+            h = len(sliders) * row + 8
+            pygame.draw.rect(screen, (20, 20, 30), (panel_x - 8, panel_y - 10, panel_w + 16, h), border_radius=8)
+            pygame.draw.rect(screen, (60, 60, 80), (panel_x - 8, panel_y - 10, panel_w + 16, h), 1, border_radius=8)
+
+            for s in sliders:
+                s.draw(screen, ui_font)
+
+            hint = ui_font.render("TAB: UI on/off | drag sliders", True, (150, 150, 170))
+            screen.blit(hint, (panel_x - 4, panel_y - 28))
+
         # Лёгкий overlay подсказок
-        info = f"mode={dragon.mode} | D=debug({dragon.debug}) | R=reset | 1/2/3 modes | ESC=quit"
+        info = (
+            f"mode={dragon.mode} | D=debug({dragon.debug}) | R=reset | "
+            "1/2/3 modes | F1..F7 presets | ESC=quit"
+        )
         surf = font.render(info, True, (150, 150, 170))
         screen.blit(surf, (12, 10))
 
