@@ -179,6 +179,10 @@ class Leg:
         self.pair_id = pair_id
         self.is_front = is_front
         self.name = name
+        # Диагональные пары для походки:
+        #   diag 0: FL + BR
+        #   diag 1: FR + BL
+        self.diag_id = 0 if (bool(self.side > 0) == bool(self.is_front)) else 1
 
         self.upper_len = upper_len
         self.lower_len = lower_len
@@ -193,6 +197,7 @@ class Leg:
         self.step_from = Vector2(0, 0)
         self.step_to = Vector2(0, 0)
         self.step_lift_dir = Vector2(0, -1)
+        self.lift01 = 0.0  # 0..1..0 только для визуала во время swing
 
         # Для отрисовки:
         self.hip = Vector2(0, 0)
@@ -209,6 +214,7 @@ class Leg:
         self.step_time = 0.0
         self.time_since_step = 0.0
         self.attach_vel = Vector2(0, 0)
+        self.lift01 = 0.0
 
     def begin_step(self, hip: Vector2, new_target: Vector2, lift_dir: Vector2):
         self.stepping = True
@@ -248,17 +254,19 @@ class Leg:
             if u >= 1.0:
                 self.stepping = False
                 self.foot_target = Vector2(self.step_to)
+                self.lift01 = 0.0
             else:
                 s = smoothstep01(smoothstep01(u))
                 pos = self.step_from * (1.0 - s) + self.step_to * s
 
                 # Классическая "дуга шага": sin(pi*s) даёт 0 в концах и пик в середине.
-                lift = math.sin(math.pi * s) * step_lift
-                pos += self.step_lift_dir * lift
+                self.lift01 = math.sin(math.pi * s)
+                pos += self.step_lift_dir * (self.lift01 * step_lift)
 
                 self.foot_target = pos
         else:
             self.time_since_step += dt
+            self.lift01 = 0.0
             # Липкость: пока предполагаемая опора рядом, нога "держится" за старый foot_target.
             if (
                 can_start_step
@@ -320,6 +328,8 @@ class Dragon:
         self.move_vel_eps = 40.0
         self.min_stance_time = 0.20
         self.max_step_per_pair = 1
+        self.gait_diagonal = 0  # 0: FL+BR, 1: FR+BL
+        self.gait_couple = 0.75  # если одна в диагонали шагает, вторую легче "подцепить"
 
         # Рендер/UX
         self.mode = "hybrid"         # "bones" | "skin" | "hybrid"
@@ -370,7 +380,8 @@ class Dragon:
 
                 # Инициализируем опору в разумной позиции относительно тела.
                 # В начальной позе касательная ~ (1, 0), нормаль ~ (0, 1).
-                hip = self.points[attach_idx] + Vector2(0, 1) * (side * self.leg_hip_offset)
+                r_body = self._radius_at(attach_idx)
+                hip = self.points[attach_idx] + Vector2(0, 1) * (side * (r_body + self.leg_hip_offset))
                 foot = hip + Vector2(0, 1) * (side * self.leg_spread) + Vector2(-1, 0) * self.leg_back
                 foot += Vector2(random.uniform(-6, 6), random.uniform(-6, 6))
                 leg.reset(foot)
@@ -481,14 +492,19 @@ class Dragon:
             leg.prev_attach_pos = Vector2(attach_pos)
 
         # ----------------------------
-        # 3) Лапки: липкость + шаги
+        # 3) Лапки: липкость + шаги + простой gait controller (диагонали)
         # ----------------------------
+        leg_ctx: list[tuple[Leg, Vector2, Vector2, Vector2, float, float]] = []
+        thr2 = self.step_threshold * self.step_threshold
+        any_stepping = any(l.stepping for l in self.legs)
+
         for leg in self.legs:
             idx = leg.attach_idx
             t, n = self._frame_at(idx)
 
-            # Точка бедра (hip) сидит сбоку от позвоночника.
-            hip = self.points[idx] + n * (leg.side * self.leg_hip_offset)
+            # Точка бедра (hip) сидит на "радиусе" тела, а не в центре позвоночника.
+            r_body = self._radius_at(idx)
+            hip = self.points[idx] + n * (leg.side * (r_body + self.leg_hip_offset))
 
             # "Желаемая" опора: в сторону + назад + stride по реальному движению точки крепления.
             u = idx / (self.N - 1)
@@ -521,6 +537,35 @@ class Dragon:
             bend_side = float(leg.side if leg.is_front else -leg.side)
             bend_dir = bend_side * forward_sign
 
+            dist2 = (desired - leg.foot_target).length_squared()
+            leg_ctx.append((leg, hip, desired, move_dir, bend_dir, dist2))
+
+        # Переключаем диагональ только когда все лапы в stance (иначе будут "две диагонали сразу").
+        if not any_stepping:
+            active_need = any(
+                (leg.diag_id == self.gait_diagonal)
+                and (dist2 > thr2)
+                and (leg.time_since_step >= self.min_stance_time)
+                for (leg, _hip, _desired, _move_dir, _bend_dir, dist2) in leg_ctx
+            )
+            other_need = any(
+                (leg.diag_id != self.gait_diagonal)
+                and (dist2 > thr2)
+                and (leg.time_since_step >= self.min_stance_time)
+                for (leg, _hip, _desired, _move_dir, _bend_dir, dist2) in leg_ctx
+            )
+            if (not active_need) and other_need:
+                self.gait_diagonal = 1 - self.gait_diagonal
+
+        # Если одна лапа в активной диагонали стартует, слегка облегчим старт второй.
+        diag_trigger = (not any_stepping) and any(
+            (leg.diag_id == self.gait_diagonal)
+            and (dist2 > thr2)
+            and (leg.time_since_step >= self.min_stance_time)
+            for (leg, _hip, _desired, _move_dir, _bend_dir, dist2) in leg_ctx
+        )
+
+        for leg, hip, desired, move_dir, bend_dir, dist2 in leg_ctx:
             pair_step_count = 0
             for pair_leg in self.legs:
                 if pair_leg.pair_id == leg.pair_id and pair_leg.stepping:
@@ -528,11 +573,18 @@ class Dragon:
 
             partner = self._pair_partner(leg.pair_id, leg.side)
             partner_idle = (partner is None) or (not partner.stepping)
+
+            diag_allowed = leg.diag_id == self.gait_diagonal
             can_start_step = (
-                leg.time_since_step >= self.min_stance_time
-                and pair_step_count < self.max_step_per_pair
+                diag_allowed
+                and (leg.time_since_step >= self.min_stance_time)
+                and (pair_step_count < self.max_step_per_pair)
                 and partner_idle
             )
+
+            step_thr = self.step_threshold
+            if diag_allowed and diag_trigger:
+                step_thr *= self.gait_couple
 
             leg.upper_len = self.leg_upper
             leg.lower_len = self.leg_lower
@@ -540,7 +592,7 @@ class Dragon:
                 dt=dt,
                 hip=hip,
                 desired_foothold=desired,
-                step_threshold=self.step_threshold,
+                step_threshold=step_thr,
                 step_duration=self.step_duration,
                 step_lift=self.step_lift,
                 bend_dir=bend_dir,
@@ -548,22 +600,25 @@ class Dragon:
             )
 
     def draw(self, screen: pygame.Surface):
-        # Цвета (светлые линии на чёрном фоне)
+        # Цвета (читаемая "плоть" + контуры поверх)
         col_bone = (210, 210, 235)
         col_rib = (170, 170, 205)
-        col_skin = (200, 200, 230)
-        col_leg = (200, 200, 235)
+        col_body_outline = (205, 205, 235)
+        col_body_fill = (118, 118, 145)
+        col_leg_fill = (92, 92, 118)      # чуть темнее тела
+        col_leg_outline = (185, 185, 215)
         col_debug = (120, 220, 140)
         col_debug2 = (220, 160, 120)
 
+        # Лапы рисуем первыми, чтобы тело могло перекрыть "плечо/таз" (вид сверху).
+        self._draw_legs(screen, col_leg_fill, col_leg_outline, col_debug2 if self.debug else None)
+
         if self.mode in ("skin", "hybrid"):
-            self._draw_skin(screen, col_skin)
+            self._draw_skin(screen, color_outline=col_body_outline, color_fill=col_body_fill)
 
         if self.mode in ("bones", "hybrid"):
             self._draw_bones(screen, col_bone)
             self._draw_ribs(screen, col_rib)
-
-        self._draw_legs(screen, col_leg, col_debug2 if self.debug else None)
 
         self._draw_head(screen, col_bone)
 
@@ -574,7 +629,7 @@ class Dragon:
         pts = [v2i(p) for p in self.points]
         pygame.draw.lines(screen, color, False, pts, 1)
 
-    def _draw_skin(self, screen: pygame.Surface, color):
+    def _draw_skin(self, screen: pygame.Surface, color_outline, color_fill=None):
         left_pts = []
         right_pts = []
 
@@ -597,7 +652,9 @@ class Dragon:
 
         poly = left_pts + right_pts[::-1]
         if len(poly) >= 3:
-            pygame.draw.polygon(screen, color, poly, 1)
+            if color_fill is not None:
+                pygame.draw.polygon(screen, color_fill, poly, 0)
+            pygame.draw.polygon(screen, color_outline, poly, 1)
 
     def _draw_ribs(self, screen: pygame.Surface, color):
         # Рисуем "рёбра/чешую" как дуги в локальном базисе (t, n).
@@ -632,46 +689,109 @@ class Dragon:
 
                 pygame.draw.lines(screen, color, False, pts, self.rib_width)
 
-    def _draw_legs(self, screen: pygame.Surface, color, debug_color=None):
+    def _draw_capsule(
+        self,
+        screen: pygame.Surface,
+        a: Vector2,
+        b: Vector2,
+        r: float,
+        color_fill,
+        color_outline=None,
+    ):
+        r = float(r)
+        if r <= 0.5:
+            return
+
+        d = b - a
+        if d.length_squared() < 1e-9:
+            rr = max(1, int(r))
+            pygame.draw.circle(screen, color_fill, v2i(a), rr, 0)
+            if color_outline is not None:
+                pygame.draw.circle(screen, color_outline, v2i(a), rr, 1)
+            return
+
+        u = d.normalize()
+        n = Vector2(-u.y, u.x)
+        pts = [a + n * r, b + n * r, b - n * r, a - n * r]
+        pts_i = [v2i(p) for p in pts]
+
+        rr = max(1, int(r))
+        pygame.draw.polygon(screen, color_fill, pts_i, 0)
+        pygame.draw.circle(screen, color_fill, v2i(a), rr, 0)
+        pygame.draw.circle(screen, color_fill, v2i(b), rr, 0)
+
+        if color_outline is not None:
+            pygame.draw.polygon(screen, color_outline, pts_i, 1)
+            pygame.draw.circle(screen, color_outline, v2i(a), rr, 1)
+            pygame.draw.circle(screen, color_outline, v2i(b), rr, 1)
+
+    def _draw_legs(self, screen: pygame.Surface, color_fill, color_outline, debug_color=None):
+        def mix(c0, c1, t: float):
+            tt = clamp(t, 0.0, 1.0)
+            return (
+                int(c0[0] + (c1[0] - c0[0]) * tt),
+                int(c0[1] + (c1[1] - c0[1]) * tt),
+                int(c0[2] + (c1[2] - c0[2]) * tt),
+            )
+
         for leg in self.legs:
             hip = leg.hip
             knee = leg.knee
             foot = leg.foot
 
-            # Небольшая тейперовка толщины лап в зависимости от положения по телу
-            base = max(1, int(self.leg_thickness))
             u = leg.attach_idx / (self.N - 1)
-            w1 = max(3, int(base * (1.15 - 0.35 * u)))
-            w2 = max(2, int(base * (0.90 - 0.45 * u)))
+            lift = float(leg.lift01)  # 0..1..0 (swing)
 
-            pygame.draw.line(screen, color, v2i(hip), v2i(knee), w1)
-            pygame.draw.line(screen, color, v2i(knee), v2i(foot), w2)
+            # Толщина: thigh толще shin, в swing чуть "ближе к камере".
+            base_w = max(5.0, float(self.leg_thickness))
+            taper = 1.10 - 0.22 * u
+            shin_w = max(5.0, base_w * 1.15 * taper)
+            thigh_w = max(shin_w + 2.0, base_w * 1.55 * taper)
 
-            r_hip = max(2, int(base * 0.62))
-            r_knee = max(2, int(base * 0.56))
-            r_foot = max(2, int(base * 0.48))
-            pygame.draw.circle(screen, color, v2i(hip), r_hip, 1)
-            pygame.draw.circle(screen, color, v2i(knee), r_knee, 1)
-            pygame.draw.circle(screen, color, v2i(foot), r_foot, 1)
+            scale = 1.0 + 0.22 * lift
+            shin_r = (shin_w * scale) * 0.5
+            thigh_r = (thigh_w * scale) * 0.5
 
-            # "Ступня": маленький клин/ромб в базисе стопы.
-            to_foot = safe_normalize(foot - knee, Vector2(1, 0))
-            n = Vector2(-to_foot.y, to_foot.x)
-            foot_len = 10.0 * (1.0 - 0.25 * u)
-            foot_w = 4.8 * (1.0 - 0.30 * u)
-            toe = foot + to_foot * (foot_len * 0.75)
-            heel = foot - to_foot * (foot_len * 0.45)
-            left = heel + n * foot_w
-            right = heel - n * foot_w
-            mid = foot - to_foot * (foot_len * 0.08)
-            pygame.draw.polygon(screen, color, [v2i(toe), v2i(left), v2i(mid), v2i(right)], 1)
+            seg_fill = mix(color_fill, color_outline, 0.35 * lift)
+            seg_outline = mix(color_outline, (255, 255, 255), 0.10 * lift)
 
-            # Когти привязаны к базису ступни.
-            claw_len = 4.8 * (1.0 - 0.35 * u)
+            # 1) Thigh (бедро): hip -> knee
+            self._draw_capsule(screen, hip, knee, thigh_r, seg_fill, seg_outline)
+            # 2) Shin (голень): knee -> foot
+            self._draw_capsule(screen, knee, foot, shin_r, seg_fill, seg_outline)
+
+            # Суставы (чтобы нога не была "палкой"):
+            knee_r = max(2, int(shin_r * 0.85))
+            hip_r = max(2, int(thigh_r * 0.75))
+            joint_fill = mix(seg_fill, seg_outline, 0.55)
+            pygame.draw.circle(screen, joint_fill, v2i(hip), hip_r, 0)
+            pygame.draw.circle(screen, seg_outline, v2i(hip), hip_r, 1)
+            pygame.draw.circle(screen, joint_fill, v2i(knee), knee_r, 0)
+            pygame.draw.circle(screen, seg_outline, v2i(knee), knee_r, 1)
+
+            # 3) Foot (стопа): клин + когти (без "стрелочек").
+            fwd = safe_normalize(foot - knee, Vector2(1, 0))
+            side = Vector2(-fwd.y, fwd.x)
+            foot_len = max(12.0, shin_w * 2.2) * scale
+            foot_w = max(7.0, shin_w * 1.35) * scale
+
+            toe = foot + fwd * (foot_len * 0.70)
+            heel = foot - fwd * (foot_len * 0.55)
+            left = foot + side * (foot_w * 0.70) - fwd * (foot_len * 0.12)
+            right = foot - side * (foot_w * 0.70) - fwd * (foot_len * 0.12)
+
+            foot_fill = mix(seg_fill, (0, 0, 0), 0.18)
+            foot_poly = [v2i(toe), v2i(left), v2i(heel), v2i(right)]
+            pygame.draw.polygon(screen, foot_fill, foot_poly, 0)
+            pygame.draw.polygon(screen, seg_outline, foot_poly, 1)
+
+            claw_len = max(5.0, shin_w * 0.95) * (0.85 + 0.25 * lift)
             for s in (-1, 0, +1):
-                base_pt = toe + n * (s * 1.8)
-                tip = base_pt + to_foot * claw_len + n * (s * 1.1)
-                pygame.draw.line(screen, color, v2i(base_pt), v2i(tip), 1)
+                base = toe + side * (s * foot_w * 0.18) - fwd * (foot_len * 0.06)
+                tip = base + fwd * claw_len + side * (s * foot_w * 0.05)
+                b1 = base + side * (foot_w * 0.10)
+                b2 = base - side * (foot_w * 0.10)
+                pygame.draw.polygon(screen, seg_outline, [v2i(tip), v2i(b1), v2i(b2)], 0)
 
             if debug_color is not None:
                 pygame.draw.circle(screen, debug_color, v2i(leg.foot_target), 3, 1)
